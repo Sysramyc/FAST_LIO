@@ -649,15 +649,15 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
 
   // Publish tf from lidar_odom to base_link
-  static geometry_msgs::msg::TransformStamped livox_to_base_link_transform;
+  static geometry_msgs::msg::TransformStamped imu_to_base_link_transform;
   static bool transform_acquired = false; // Check if the transform has already been acquired
   if (!transform_acquired) {
-      // Get the transform from base_link to livox_frame
+      // Get the transform from base_link to imu_link
       try {
-          livox_to_base_link_transform = tf_buffer_->lookupTransform("livox_frame", "base_link", odomAftMapped.header.stamp);
+          imu_to_base_link_transform = tf_buffer_->lookupTransform("imu_link", "base_link", odomAftMapped.header.stamp);
           transform_acquired = true; // Set the flag to true indicating that the transform has been acquired
       } catch (tf2::TransformException &ex) {
-          RCLCPP_ERROR(logger_, "Failed to lookup transform from base_link to livox_frame: %s", ex.what());
+          RCLCPP_ERROR(logger_, "Failed to lookup transform from base_link to imu_link: %s", ex.what());
           return;
       }
   }
@@ -668,13 +668,14 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
   transform_stamped.header.frame_id = "lidar_odom";  // Source frame
   transform_stamped.child_frame_id = "base_link";    // Target frame
 
-  // Calculate the transform from lidar_odom to base_link by multiplying the transforms
-  tf2::Transform tf_lidar_odom_to_livox_frame;
-  tf2::fromMsg(odomAftMapped.pose.pose, tf_lidar_odom_to_livox_frame);
-  tf2::Transform tf_livox_frame_to_base_link;
-  tf2::fromMsg(livox_to_base_link_transform.transform, tf_livox_frame_to_base_link);
+  // Calculate the transform from lidar_odom to base_link by multiplying the transforms.
+  // odomAftMapped.pose stores the IMU (imu_link) pose, so compose it with imu_link -> base_link.
+  tf2::Transform tf_lidar_odom_to_imu;
+  tf2::fromMsg(odomAftMapped.pose.pose, tf_lidar_odom_to_imu);
+  tf2::Transform tf_imu_to_base_link;
+  tf2::fromMsg(imu_to_base_link_transform.transform, tf_imu_to_base_link);
   tf2::Transform tf_lidar_odom_to_base_link =
-    tf_lidar_odom_to_livox_frame * tf_livox_frame_to_base_link;
+    tf_lidar_odom_to_imu * tf_imu_to_base_link;
 
   // Convert the resulting transform back to geometry_msgs::TransformStamped
   transform_stamped.transform = tf2::toMsg(tf_lidar_odom_to_base_link);
