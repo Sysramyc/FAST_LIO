@@ -93,7 +93,8 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic;
+string map_file_path, lid_topic, imu_topic, imu_frame;
+vector<double> gyr_scale_vec(3, 1.0);  // 陀螺标度校正：IMU 角速度 × 该系数（默认 1 不校正）
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -360,7 +361,12 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     publish_count ++;
     // cout<<"IMU got at: "<<msg_in->header.stamp.toSec()<<endl;
     sensor_msgs::msg::Imu::SharedPtr msg(new sensor_msgs::msg::Imu(*msg_in));
-    
+
+    // 陀螺标度校正：大yaw 连续旋转时，IMU 陀螺标度误差会让 LIO 的 yaw 估计按
+    // 固定比例漂移（建图糊成同心圆）。对原始角速度乘一个接近 1 的系数即可压掉。
+    msg->angular_velocity.x *= gyr_scale_vec[0];
+    msg->angular_velocity.y *= gyr_scale_vec[1];
+    msg->angular_velocity.z *= gyr_scale_vec[2];
 
     msg->header.stamp = get_ros_time(get_time_sec(msg_in->header.stamp) - time_diff_lidar_to_imu);
     if (abs(timediff_lidar_wrt_imu) > 0.1 && time_sync_en)
@@ -649,19 +655,20 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
 
   // Publish tf from lidar_odom to base_link
-  static geometry_msgs::msg::TransformStamped imu_to_base_link_transform;
-  static bool transform_acquired = false; // Check if the transform has already been acquired
-  if (!transform_acquired) {
-      // Get the transform from base_link to imu_link
-      try {
-          imu_to_base_link_transform = tf_buffer_->lookupTransform("imu_link", "base_link", odomAftMapped.header.stamp);
-          transform_acquired = true; // Set the flag to true indicating that the transform has been acquired
-      } catch (tf2::TransformException &ex) {
-          RCLCPP_ERROR(logger_, "Failed to lookup transform from base_link to imu_link: %s", ex.what());
-          return;
-      }
+  geometry_msgs::msg::TransformStamped imu_to_base_link_transform;
+  // 每帧都查一次，让旋转的 big_yaw_joint 反映到 base_link。
+  // 必须用激光帧时间戳查：保证解旋角与 LIO 位姿同一时刻，否则大yaw 转起来时
+  // "最新角 - 旧位姿"会让 base_link 逐帧抖（nav 视图点云抖）。
+  // 若激光时间戳略超前于 TF（Livox 时钟偏快）触发外插异常，退回最新可用 TF。
+  try {
+      imu_to_base_link_transform = tf_buffer_->lookupTransform(imu_frame, "base_link", odomAftMapped.header.stamp);
+  } catch (const tf2::ExtrapolationException &ex) {
+      imu_to_base_link_transform = tf_buffer_->lookupTransform(imu_frame, "base_link", tf2::TimePointZero);
+  } catch (const tf2::TransformException &ex) {
+      RCLCPP_ERROR(logger_, "Failed to lookup transform from %s to base_link: %s", imu_frame.c_str(), ex.what());
+      return;
   }
-  
+
   // Create a TransformStamped message for lidar_odom to base_link
   geometry_msgs::msg::TransformStamped transform_stamped;
   transform_stamped.header.stamp = odomAftMapped.header.stamp;
@@ -834,6 +841,8 @@ public:
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<string>("common.imu_frame", "imu_link");
+        this->declare_parameter<vector<double>>("common.gyr_scale", vector<double>{1.0, 1.0, 1.0});
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -870,6 +879,9 @@ public:
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
+        this->get_parameter_or<string>("common.imu_frame", imu_frame, "imu_link");
+        this->get_parameter_or<vector<double>>("common.gyr_scale", gyr_scale_vec, vector<double>{1.0, 1.0, 1.0});
+        if (gyr_scale_vec.size() != 3) { gyr_scale_vec = vector<double>{1.0, 1.0, 1.0}; }
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
